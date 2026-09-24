@@ -66,7 +66,8 @@ async function getStore(): Promise<Store> {
 
 /**
  * Persist a key-value pair to the Tauri plugin-store.
- * Fire-and-forget: errors are logged but do not block the UI.
+ * Errors are logged and re-thrown so callers that need deterministic persistence
+ * can await the write before continuing.
  */
 async function persistValue(key: string, value: unknown): Promise<void> {
   try {
@@ -74,6 +75,7 @@ async function persistValue(key: string, value: unknown): Promise<void> {
     await store.set(key, value);
   } catch (err) {
     console.error(`[configStore] Failed to persist "${key}":`, err);
+    throw err;
   }
 }
 
@@ -185,7 +187,7 @@ interface ConfigState {
   setTheme: (theme: ThemeMode) => void;
   setContextStrategy: (strategy: ContextStrategy) => void;
   setSTTProvider: (provider: STTProviderType) => void;
-  setSTTLanguage: (language: string) => void;
+  setSTTLanguage: (language: string) => Promise<void>;
   setLLMProvider: (provider: LLMProviderType) => void;
   setLLMModel: (model: string) => void;
   setMicDeviceId: (id: string | null) => void;
@@ -310,57 +312,63 @@ export const useConfigStore = create<ConfigState>((set) => ({
 
   setContextStrategy: (strategy) => {
     set({ contextStrategy: strategy });
-    persistValue("contextStrategy", strategy);
+    persistValue("contextStrategy", strategy).catch(() => {});
   },
   setTheme: (theme) => {
     set({ theme });
-    persistValue("theme", theme);
+    persistValue("theme", theme).catch(() => {});
   },
   setSTTProvider: (provider) => {
     set({ sttProvider: provider });
-    persistValue("sttProvider", provider);
+    persistValue("sttProvider", provider).catch(() => {});
   },
-  setSTTLanguage: (language) => {
+  setSTTLanguage: async (language) => {
     set({ sttLanguage: language });
-    persistValue("sttLanguage", language);
-    // Apply immediately to Rust backend
-    import("../lib/ipc").then(({ setSTTLanguage: setBackendSTTLanguage }) =>
-      setBackendSTTLanguage(language)
-        .catch((e) => console.warn("[configStore] Failed to update STT language:", e))
-    );
+
+    try {
+      // Persist the user's choice before returning so a rapid app restart
+      // cannot race the plugin-store write.
+      await persistValue("sttLanguage", language);
+
+      // Then apply the same exact BCP-47 value to the live Rust router.
+      const { setSTTLanguage: setBackendSTTLanguage } = await import("../lib/ipc");
+      await setBackendSTTLanguage(language);
+    } catch (e) {
+      console.warn("[configStore] Failed to persist/apply STT language:", e);
+    }
   },
   setLLMProvider: (provider) => {
     set({ llmProvider: provider });
-    persistValue("llmProvider", provider);
+    persistValue("llmProvider", provider).catch(() => {});
   },
   setLLMModel: (model) => {
     set({ llmModel: model });
-    persistValue("llmModel", model);
+    persistValue("llmModel", model).catch(() => {});
   },
   setMicDeviceId: (id) => {
     set({ micDeviceId: id });
-    persistValue("micDeviceId", id);
+    persistValue("micDeviceId", id).catch(() => {});
   },
   setSystemDeviceId: (id) => {
     set({ systemDeviceId: id });
-    persistValue("systemDeviceId", id);
+    persistValue("systemDeviceId", id).catch(() => {});
   },
   setRecordingEnabled: (enabled) => {
     set({ recordingEnabled: enabled });
-    persistValue("recordingEnabled", enabled);
+    persistValue("recordingEnabled", enabled).catch(() => {});
   },
   setMeetingAudioConfig: (config) => {
     set({ meetingAudioConfig: config });
-    persistValue("meetingAudioConfig", config);
+    persistValue("meetingAudioConfig", config).catch(() => {});
     // Keep legacy fields in sync for backward compatibility
     set({
       micDeviceId: config.you.device_id || null,
       systemDeviceId: config.them.device_id || null,
       recordingEnabled: config.recording_enabled,
     });
-    persistValue("micDeviceId", config.you.device_id || null);
-    persistValue("systemDeviceId", config.them.device_id || null);
-    persistValue("recordingEnabled", config.recording_enabled);
+    persistValue("micDeviceId", config.you.device_id || null).catch(() => {});
+    persistValue("systemDeviceId", config.them.device_id || null).catch(() => {});
+    persistValue("recordingEnabled", config.recording_enabled).catch(() => {});
   },
   saveCustomPreset: (name) => {
     const state = useConfigStore.getState();
@@ -369,22 +377,20 @@ export const useConfigStore = create<ConfigState>((set) => ({
       ...state.meetingAudioConfig,
       preset_name: name,
     };
-    // Replace if exists, else append
     const existing = state.customPresets.filter((p) => p.preset_name !== name);
     const updated = [...existing, preset];
     set({ customPresets: updated });
-    persistValue("customPresets", updated);
+    persistValue("customPresets", updated).catch(() => {});
   },
   deleteCustomPreset: (name) => {
     const state = useConfigStore.getState();
     const updated = state.customPresets.filter((p) => p.preset_name !== name);
     set({ customPresets: updated });
-    persistValue("customPresets", updated);
+    persistValue("customPresets", updated).catch(() => {});
   },
   setActiveWhisperModel: (modelId) => {
     set({ activeWhisperModel: modelId });
-    persistValue("activeWhisperModel", modelId);
-    // Also update local_model_id on any party using whisper_cpp
+    persistValue("activeWhisperModel", modelId).catch(() => {});
     const state = useConfigStore.getState();
     if (state.meetingAudioConfig && modelId) {
       const cfg = { ...state.meetingAudioConfig };
@@ -399,7 +405,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
       }
       if (changed) {
         set({ meetingAudioConfig: cfg });
-        persistValue("meetingAudioConfig", cfg);
+        persistValue("meetingAudioConfig", cfg).catch(() => {});
       }
     }
   },
@@ -412,15 +418,13 @@ export const useConfigStore = create<ConfigState>((set) => ({
       delete updated[engineId];
     }
     set({ activeModelPerEngine: updated });
-    persistValue("activeModelPerEngine", updated);
-    // Dev log: model activation
+    persistValue("activeModelPerEngine", updated).catch(() => {});
     import("../stores/devLogStore").then(({ useDevLogStore }) => {
       useDevLogStore.getState().addEntry(
         "info", "config",
         `Model activated: ${engineId} → ${modelId ?? "none"}`
       );
     });
-    // Also update local_model_id on any party using this engine
     if (state.meetingAudioConfig && modelId) {
       const cfg = { ...state.meetingAudioConfig };
       let changed = false;
@@ -434,13 +438,13 @@ export const useConfigStore = create<ConfigState>((set) => ({
       }
       if (changed) {
         set({ meetingAudioConfig: cfg });
-        persistValue("meetingAudioConfig", cfg);
+        persistValue("meetingAudioConfig", cfg).catch(() => {});
         import("../stores/devLogStore").then(({ useDevLogStore }) => {
           useDevLogStore.getState().addEntry(
             "info", "config",
-            `Model change propagated to audio config` +
-            (cfg.you.stt_provider === engineId ? ` (You → ${modelId})` : "") +
-            (cfg.them.stt_provider === engineId ? ` (Them → ${modelId})` : "")
+            `Model change propagated to audio config`
+            + (cfg.you.stt_provider === engineId ? ` (You → ${modelId})` : "")
+            + (cfg.them.stt_provider === engineId ? ` (Them → ${modelId})` : "")
           );
         });
       }
@@ -452,8 +456,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
   },
   setWhisperDualPass: (config) => {
     set({ whisperDualPass: config });
-    persistValue("whisperDualPass", config);
-    // Apply immediately to Rust backend
+    persistValue("whisperDualPass", config).catch(() => {});
     import("../lib/ipc").then(({ updateWhisperDualPassConfig }) =>
       updateWhisperDualPassConfig(config.shortChunkSecs, config.longChunkSecs, config.pauseSecs)
         .catch((e) => console.warn("[configStore] Failed to update whisper dual-pass config:", e))
@@ -461,8 +464,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
   },
   setDeepgramConfig: (config) => {
     set({ deepgramConfig: config });
-    persistValue("deepgramConfig", config);
-    // Apply immediately to Rust backend
+    persistValue("deepgramConfig", config).catch(() => {});
     import("../lib/ipc").then(({ updateDeepgramConfig }) =>
       updateDeepgramConfig(config)
         .catch((e) => console.warn("[configStore] Failed to update Deepgram config:", e))
@@ -470,8 +472,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
   },
   setGroqConfig: (config) => {
     set({ groqConfig: config });
-    persistValue("groqConfig", config);
-    // Apply immediately to Rust backend
+    persistValue("groqConfig", config).catch(() => {});
     import("../lib/ipc").then(({ updateGroqConfig }) =>
       updateGroqConfig(config)
         .catch((e) => console.warn("[configStore] Failed to update Groq config:", e))
@@ -479,8 +480,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
   },
   setPauseThresholdMs: (ms) => {
     set({ pauseThresholdMs: ms });
-    persistValue("pauseThresholdMs", ms);
-    // Apply immediately to Rust backend
+    persistValue("pauseThresholdMs", ms).catch(() => {});
     import("../lib/ipc").then(({ setPauseThreshold }) =>
       setPauseThreshold(ms)
         .catch((e) => console.warn("[configStore] Failed to update pause threshold:", e))
@@ -488,99 +488,99 @@ export const useConfigStore = create<ConfigState>((set) => ({
   },
   setAutoTrigger: (enabled) => {
     set({ autoTrigger: enabled });
-    persistValue("autoTrigger", enabled);
+    persistValue("autoTrigger", enabled).catch(() => {});
   },
   setAutoSummary: (enabled) => {
     set({ autoSummary: enabled });
-    persistValue("autoSummary", enabled);
+    persistValue("autoSummary", enabled).catch(() => {});
   },
   setContextWindowSeconds: (seconds) => {
     set({ contextWindowSeconds: seconds });
-    persistValue("contextWindowSeconds", seconds);
+    persistValue("contextWindowSeconds", seconds).catch(() => {});
   },
   setStartOnLogin: (enabled) => {
     set({ startOnLogin: enabled });
-    persistValue("startOnLogin", enabled);
+    persistValue("startOnLogin", enabled).catch(() => {});
   },
   setDataDirectory: (dir) => {
     set({ dataDirectory: dir });
-    persistValue("dataDirectory", dir);
+    persistValue("dataDirectory", dir).catch(() => {});
   },
   setFirstRunCompleted: (completed) => {
     set({ firstRunCompleted: completed });
-    persistValue("firstRunCompleted", completed);
+    persistValue("firstRunCompleted", completed).catch(() => {});
   },
   setHotkeys: (hotkeys) => {
     set({ hotkeys });
-    persistValue("hotkeys", hotkeys);
+    persistValue("hotkeys", hotkeys).catch(() => {});
   },
   setVerifiedCloudProviders: (providers) => {
     set({ verifiedCloudProviders: providers });
-    persistValue("verifiedCloudProviders", providers);
+    persistValue("verifiedCloudProviders", providers).catch(() => {});
   },
   setRememberedMeetingSetup: (setup) => {
     set({ rememberedMeetingSetup: setup });
-    persistValue("rememberedMeetingSetup", setup);
+    persistValue("rememberedMeetingSetup", setup).catch(() => {});
   },
   setDiarizationEnabled: (enabled) => {
     set({ diarizationEnabled: enabled });
-    persistValue("diarizationEnabled", enabled);
+    persistValue("diarizationEnabled", enabled).catch(() => {});
   },
   setNoisePreset: (preset) => {
     set({ noisePreset: preset });
-    persistValue("noisePreset", preset);
+    persistValue("noisePreset", preset).catch(() => {});
   },
   setConfidenceThreshold: (threshold) => {
     set({ confidenceThreshold: threshold });
-    persistValue("confidenceThreshold", threshold);
+    persistValue("confidenceThreshold", threshold).catch(() => {});
   },
   setConfidenceHighlightEnabled: (enabled) => {
     set({ confidenceHighlightEnabled: enabled });
-    persistValue("confidenceHighlightEnabled", enabled);
+    persistValue("confidenceHighlightEnabled", enabled).catch(() => {});
   },
   setTranscriptFontSize: (size) => {
     set({ transcriptFontSize: size });
-    persistValue("transcriptFontSize", size);
+    persistValue("transcriptFontSize", size).catch(() => {});
   },
   setTranslationFontSize: (size) => {
     set({ translationFontSize: size });
-    persistValue("translationFontSize", size);
+    persistValue("translationFontSize", size).catch(() => {});
   },
   setTranscriptTextColor: (color) => {
     set({ transcriptTextColor: color });
-    persistValue("transcriptTextColor", color);
+    persistValue("transcriptTextColor", color).catch(() => {});
   },
   setTranslationTextColor: (color) => {
     set({ translationTextColor: color });
-    persistValue("translationTextColor", color);
+    persistValue("translationTextColor", color).catch(() => {});
   },
   setAiResponseTextColor: (color) => {
     set({ aiResponseTextColor: color });
-    persistValue("aiResponseTextColor", color);
+    persistValue("aiResponseTextColor", color).catch(() => {});
   },
   setAiResponseFontSize: (size) => {
     set({ aiResponseFontSize: size });
-    persistValue("aiResponseFontSize", size);
+    persistValue("aiResponseFontSize", size).catch(() => {});
   },
   setAiResponseLineHeight: (v) => {
     set({ aiResponseLineHeight: v });
-    persistValue("aiResponseLineHeight", v);
+    persistValue("aiResponseLineHeight", v).catch(() => {});
   },
   setAiResponseHPad: (v) => {
     set({ aiResponseHPad: v });
-    persistValue("aiResponseHPad", v);
+    persistValue("aiResponseHPad", v).catch(() => {});
   },
   setAiResponseAlign: (align) => {
     set({ aiResponseAlign: align });
-    persistValue("aiResponseAlign", align);
+    persistValue("aiResponseAlign", align).catch(() => {});
   },
   setOverlayOpacity: (opacity) => {
     set({ overlayOpacity: opacity });
-    persistValue("overlayOpacity", opacity);
+    persistValue("overlayOpacity", opacity).catch(() => {});
   },
   setShowPostMeetingTranslation: (enabled) => {
     set({ showPostMeetingTranslation: enabled });
-    persistValue("showPostMeetingTranslation", enabled);
+    persistValue("showPostMeetingTranslation", enabled).catch(() => {});
   },
   toggleOpenRouterFavorite: (id) => {
     const { openrouterFavorites } = useConfigStore.getState();
@@ -588,56 +588,49 @@ export const useConfigStore = create<ConfigState>((set) => ({
       ? openrouterFavorites.filter((fav) => fav !== id)
       : [...openrouterFavorites, id];
     set({ openrouterFavorites: next });
-    persistValue("openrouterFavorites", next);
+    persistValue("openrouterFavorites", next).catch(() => {});
   },
   addOpenRouterRecentlyUsed: (id) => {
     const { openrouterRecentlyUsed } = useConfigStore.getState();
     const next = [id, ...openrouterRecentlyUsed.filter((r) => r !== id)].slice(0, 5);
     set({ openrouterRecentlyUsed: next });
-    persistValue("openrouterRecentlyUsed", next);
+    persistValue("openrouterRecentlyUsed", next).catch(() => {});
   },
   removeOpenRouterRecentlyUsed: (id) => {
     const { openrouterRecentlyUsed } = useConfigStore.getState();
     const next = openrouterRecentlyUsed.filter((r) => r !== id);
     set({ openrouterRecentlyUsed: next });
-    persistValue("openrouterRecentlyUsed", next);
+    persistValue("openrouterRecentlyUsed", next).catch(() => {});
   },
   clearOpenRouterRecentlyUsed: () => {
     set({ openrouterRecentlyUsed: [] });
-    persistValue("openrouterRecentlyUsed", []);
+    persistValue("openrouterRecentlyUsed", []).catch(() => {});
   },
   setTrayNotifications: (enabled) => {
     set({ trayNotifications: enabled });
-    persistValue("trayNotifications", enabled);
+    persistValue("trayNotifications", enabled).catch(() => {});
   },
   setTrayAutoStart: (enabled) => {
     set({ trayAutoStart: enabled });
-    persistValue("trayAutoStart", enabled);
+    persistValue("trayAutoStart", enabled).catch(() => {});
   },
   setTrayStartMinimized: (enabled) => {
     set({ trayStartMinimized: enabled });
-    persistValue("trayStartMinimized", enabled);
+    persistValue("trayStartMinimized", enabled).catch(() => {});
   },
   setTrayAutoDetectMeeting: (enabled) => {
     set({ trayAutoDetectMeeting: enabled });
-    persistValue("trayAutoDetectMeeting", enabled);
+    persistValue("trayAutoDetectMeeting", enabled).catch(() => {});
   },
   setTrayStealthEnabled: (enabled) => {
     set({ trayStealthEnabled: enabled });
-    persistValue("trayStealthEnabled", enabled);
+    persistValue("trayStealthEnabled", enabled).catch(() => {});
   },
   setStealthShortcut: (shortcut) => {
     set({ stealthShortcut: shortcut });
-    persistValue("stealthShortcut", shortcut);
+    persistValue("stealthShortcut", shortcut).catch(() => {});
   },
 
-  /**
-   * Load all persisted config values from the Tauri plugin-store on app start.
-   * Any key not found in the store will keep its default value.
-   * Auto-migrates old single-provider fields to the new per-party MeetingAudioConfig.
-   * IMPORTANT: Migrations only run on first load. Subsequent calls (e.g., navigating
-   * to settings mid-meeting) just reload values without applying destructive migrations.
-   */
   loadConfig: async () => {
     try {
       const alreadyLoaded = useConfigStore.getState()._loaded;
@@ -693,9 +686,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
       const trayStealthEnabled = await store.get<boolean>("trayStealthEnabled");
       const stealthShortcut = await store.get<string>("stealthShortcut");
 
-      // Auto-migrate: if no meetingAudioConfig exists but old fields do,
-      // build a MeetingAudioConfig from legacy fields.
-      // ONLY run migrations on first load — not when re-entering settings mid-meeting.
       let resolvedMeetingConfig = meetingAudioConfig ?? null;
       if (!alreadyLoaded && !resolvedMeetingConfig && (micDeviceId || systemDeviceId)) {
         resolvedMeetingConfig = {
@@ -718,8 +708,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
         console.log("[configStore] Migrated legacy audio config to meetingAudioConfig");
       }
 
-      // Migrate whisper_cpp → correct defaults (whisper_cpp is batch-only, not for live STT)
-      // Only run on first load to avoid overwriting user settings mid-meeting.
       if (!alreadyLoaded && resolvedMeetingConfig) {
         let migrated = false;
         if ((resolvedMeetingConfig.you.stt_provider as string) === "whisper_cpp") {
@@ -730,7 +718,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
           resolvedMeetingConfig.them = { ...resolvedMeetingConfig.them, stt_provider: "deepgram", local_model_id: undefined };
           migrated = true;
         }
-        // windows_native only works with mic input; migrate Them (non-input) away from it
         if (
           (resolvedMeetingConfig.them.stt_provider as string) === "windows_native" &&
           !resolvedMeetingConfig.them.is_input_device
@@ -738,8 +725,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
           resolvedMeetingConfig.them = { ...resolvedMeetingConfig.them, stt_provider: "deepgram" };
           migrated = true;
         }
-        // Mutual exclusion: Web Speech / Windows Speech can only be used by one party.
-        // If both parties have exclusive providers (from old config), keep "You" and fallback "Them".
         const exclusiveProviders = ["web_speech", "windows_native"];
         if (
           exclusiveProviders.includes(resolvedMeetingConfig.you.stt_provider) &&
@@ -759,7 +744,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
         }
       }
 
-      // Migrate top-level sttProvider away from whisper_cpp (first load only)
       let resolvedSttProvider = sttProvider;
       if (!alreadyLoaded && (!resolvedSttProvider || (resolvedSttProvider as string) === "whisper_cpp")) {
         resolvedSttProvider = "windows_native" as STTProviderType;
@@ -767,7 +751,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
         console.log("[configStore] Migrated top-level sttProvider to windows_native");
       }
 
-      // If no meetingAudioConfig was found after all migrations, create a default (first load only)
       if (!alreadyLoaded && !resolvedMeetingConfig) {
         resolvedMeetingConfig = {
           you: {
@@ -866,12 +849,10 @@ export const useConfigStore = create<ConfigState>((set) => ({
         }
         if (needsPersist) {
           set({ meetingAudioConfig: resolvedMeetingConfig });
-          persistValue("meetingAudioConfig", resolvedMeetingConfig);
+          persistValue("meetingAudioConfig", resolvedMeetingConfig).catch(() => {});
         }
       }
 
-      // Set up cross-window sync: when another window changes the store,
-      // update this window's Zustand state automatically.
       store.onKeyChange<MeetingAudioConfig>("meetingAudioConfig", (val) => {
         if (val != null) set({ meetingAudioConfig: val });
       });
@@ -900,15 +881,18 @@ export const useConfigStore = create<ConfigState>((set) => ({
         if (val != null) set({ overlayOpacity: val });
       });
 
-      // Sync persisted STT language to Rust backend on startup.
+      // Synchronize the loaded language to the Rust backend before exposing
+      // the app as fully loaded. This removes the startup race where a meeting
+      // could begin while Rust still held its default en-US language.
       const loadedSttLanguage = sttLanguage ?? "en-US";
-      import("../lib/ipc").then(({ setSTTLanguage: setBackendSTTLanguage }) =>
-        setBackendSTTLanguage(loadedSttLanguage)
-          .catch((e) => console.warn("[configStore] Failed to sync STT language on load:", e))
-      );
+      try {
+        const { setSTTLanguage: setBackendSTTLanguage } = await import("../lib/ipc");
+        await setBackendSTTLanguage(loadedSttLanguage);
+      } catch (e) {
+        console.warn("[configStore] Failed to sync STT language on load:", e);
+      }
 
       // Sync persisted dual-pass config to Rust backend on startup.
-      // The Rust side starts with DualPassConfig::default(); this pushes saved values.
       const loadedDualPass = whisperDualPass ?? { shortChunkSecs: 1.0, longChunkSecs: 3.0, pauseSecs: 1.5 };
       import("../lib/ipc").then(({ updateWhisperDualPassConfig }) =>
         updateWhisperDualPassConfig(
@@ -918,29 +902,24 @@ export const useConfigStore = create<ConfigState>((set) => ({
         ).catch((e) => console.warn("[configStore] Failed to sync dual-pass config on load:", e))
       );
 
-      // Sync persisted Deepgram config to Rust backend on startup.
       const loadedDgConfig = deepgramConfig ?? DEFAULT_DEEPGRAM_CONFIG;
       import("../lib/ipc").then(({ updateDeepgramConfig }) =>
         updateDeepgramConfig(loadedDgConfig)
           .catch((e) => console.warn("[configStore] Failed to sync Deepgram config on load:", e))
       );
 
-      // Sync persisted Groq config to Rust backend on startup.
       const loadedGroqConfig = groqConfig ?? DEFAULT_GROQ_CONFIG;
       import("../lib/ipc").then(({ updateGroqConfig }) =>
         updateGroqConfig(loadedGroqConfig)
           .catch((e) => console.warn("[configStore] Failed to sync Groq config on load:", e))
       );
 
-      // Sync persisted pause threshold to Rust backend on startup.
       const loadedPauseThreshold = pauseThresholdMs ?? 3000;
       import("../lib/ipc").then(({ setPauseThreshold }) =>
         setPauseThreshold(loadedPauseThreshold)
           .catch((e) => console.warn("[configStore] Failed to sync pause threshold on load:", e))
       );
 
-      // Sync persisted LLM provider + model to Rust backend on startup.
-      // The Rust side starts with Ollama as default; this pushes the user's saved provider.
       const loadedLLMProvider = llmProvider ?? "ollama";
       const loadedLLMModel = llmModel ?? "";
       if (loadedLLMProvider) {
