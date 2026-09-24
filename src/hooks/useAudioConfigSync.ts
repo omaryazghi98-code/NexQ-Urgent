@@ -25,13 +25,9 @@ export function useAudioConfigSync() {
     ? JSON.stringify({ config: meetingAudioConfig, language: sttLanguage })
     : null;
 
-  // What Rust currently has running — only updated after successful restart
   const appliedConfigRef = useRef<string | null>(null);
-  // What we've already scheduled a restart for — prevents duplicate debounces
   const pendingConfigRef = useRef<string | null>(null);
-  // Guard against concurrent restart attempts
   const restartingRef = useRef(false);
-  // Debounce timer to batch rapid config changes
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -39,20 +35,15 @@ export function useAudioConfigSync() {
 
     const configKey = runtimeKey;
 
-    // On first run (meeting just started), record the applied runtime state
     if (appliedConfigRef.current === null) {
       appliedConfigRef.current = configKey;
       pendingConfigRef.current = configKey;
       return;
     }
 
-    // Already applied — nothing to do
     if (appliedConfigRef.current === configKey) return;
-
-    // Already scheduled a restart for this exact runtime state
     if (pendingConfigRef.current === configKey) return;
 
-    // Mark this runtime state as pending (prevents duplicate debounce scheduling)
     pendingConfigRef.current = configKey;
 
     const log = useDevLogStore.getState().addEntry;
@@ -63,7 +54,6 @@ export function useAudioConfigSync() {
       (meetingAudioConfig.them.local_model_id ? `(${meetingAudioConfig.them.local_model_id})` : "");
     log("info", "config", `STT runtime changed → ${desc}`);
 
-    // Cancel any existing debounce — the new state supersedes it
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
     }
@@ -71,7 +61,6 @@ export function useAudioConfigSync() {
     debounceRef.current = setTimeout(async () => {
       debounceRef.current = null;
 
-      // If already restarting, clear pending so next effect re-schedules
       if (restartingRef.current) {
         log("warn", "config", "Hot-swap already in progress — queued for retry");
         pendingConfigRef.current = null;
@@ -80,20 +69,18 @@ export function useAudioConfigSync() {
 
       restartingRef.current = true;
 
-      // Read the latest state (may have changed during debounce wait)
       const latestConfig = useConfigStore.getState().meetingAudioConfig;
-      const latestLanguage = useConfigStore.getState().sttLanguage;
       if (!latestConfig) {
         restartingRef.current = false;
         return;
       }
 
+      const latestLanguage = useConfigStore.getState().sttLanguage;
       const latestKey = JSON.stringify({
         config: latestConfig,
         language: latestLanguage,
       });
 
-      // If the latest state matches what's already running, skip
       if (appliedConfigRef.current === latestKey) {
         pendingConfigRef.current = latestKey;
         restartingRef.current = false;
@@ -103,18 +90,13 @@ export function useAudioConfigSync() {
       log("info", "config", "Hot-swap: stopping current capture...");
 
       try {
-        // Finalize any interim (non-final) transcript segments before restarting,
-        // so they don't stay stuck as gray italic after the new provider takes over.
         useTranscriptStore.getState().finalizeAllInterim();
 
-        // Stop current capture and wait for full cleanup
         await stopCapture();
         log("info", "config", "Hot-swap: capture stopped, waiting for resource release...");
 
-        // Let Rust fully release WASAPI/audio resources
         await new Promise((r) => setTimeout(r, 200));
 
-        // Re-read config and language in case either changed during the stop
         const freshConfig = useConfigStore.getState().meetingAudioConfig;
         const freshLanguage = useConfigStore.getState().sttLanguage;
         if (!freshConfig) {
@@ -139,16 +121,14 @@ export function useAudioConfigSync() {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log("error", "config", `Hot-swap FAILED: ${msg}`);
-        // Reset both refs so next config change retries
         appliedConfigRef.current = null;
         pendingConfigRef.current = null;
       } finally {
         restartingRef.current = false;
       }
     }, 300);
-  }, [isRecording, meetingAudioConfig, runtimeKey, sttLanguage]);
+  }, [isRecording, meetingAudioConfig, runtimeKey]);
 
-  // Reset when meeting ends
   useEffect(() => {
     if (!isRecording) {
       appliedConfigRef.current = null;
