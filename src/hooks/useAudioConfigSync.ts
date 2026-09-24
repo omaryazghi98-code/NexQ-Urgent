@@ -1,6 +1,6 @@
-// Watches meetingAudioConfig changes during an active meeting
-// and restarts the Rust audio capture pipeline with the new config.
-// This enables "hot-swap" of STT provider and audio source mid-meeting.
+// Watches meetingAudioConfig and STT language changes during an active meeting
+// and restarts the Rust audio capture pipeline with the new settings.
+// This enables "hot-swap" of STT provider, audio source, and recognition language mid-meeting.
 //
 // Key design: debounce (300ms) + sequential restart. Two separate refs:
 // - appliedConfigRef: what Rust currently has running (only set after successful restart)
@@ -16,6 +16,14 @@ import { stopCapture, startCapturePerParty } from "../lib/ipc";
 export function useAudioConfigSync() {
   const isRecording = useMeetingStore((s) => s.isRecording);
   const meetingAudioConfig = useConfigStore((s) => s.meetingAudioConfig);
+  const sttLanguage = useConfigStore((s) => s.sttLanguage);
+
+  // Include the persisted language in the runtime signature. Provider and device
+  // hot-swaps already restart the pipeline; language changes must do the same so
+  // existing per-party Rust providers are rebuilt with the new language.
+  const runtimeKey = meetingAudioConfig
+    ? JSON.stringify({ config: meetingAudioConfig, language: sttLanguage })
+    : null;
 
   // What Rust currently has running — only updated after successful restart
   const appliedConfigRef = useRef<string | null>(null);
@@ -27,11 +35,11 @@ export function useAudioConfigSync() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (!isRecording || !meetingAudioConfig) return;
+    if (!isRecording || !meetingAudioConfig || runtimeKey === null) return;
 
-    const configKey = JSON.stringify(meetingAudioConfig);
+    const configKey = runtimeKey;
 
-    // On first run (meeting just started), record the applied config
+    // On first run (meeting just started), record the applied runtime state
     if (appliedConfigRef.current === null) {
       appliedConfigRef.current = configKey;
       pendingConfigRef.current = configKey;
@@ -41,20 +49,21 @@ export function useAudioConfigSync() {
     // Already applied — nothing to do
     if (appliedConfigRef.current === configKey) return;
 
-    // Already scheduled a restart for this exact config
+    // Already scheduled a restart for this exact runtime state
     if (pendingConfigRef.current === configKey) return;
 
-    // Mark this config as pending (prevents duplicate debounce scheduling)
+    // Mark this runtime state as pending (prevents duplicate debounce scheduling)
     pendingConfigRef.current = configKey;
 
     const log = useDevLogStore.getState().addEntry;
-    const desc = `you=${meetingAudioConfig.you.stt_provider}` +
+    const desc =
+      `language=${sttLanguage}, you=${meetingAudioConfig.you.stt_provider}` +
       (meetingAudioConfig.you.local_model_id ? `(${meetingAudioConfig.you.local_model_id})` : "") +
       `, them=${meetingAudioConfig.them.stt_provider}` +
       (meetingAudioConfig.them.local_model_id ? `(${meetingAudioConfig.them.local_model_id})` : "");
-    log("info", "config", `STT config changed → ${desc}`);
+    log("info", "config", `STT runtime changed → ${desc}`);
 
-    // Cancel any existing debounce — the new config supersedes it
+    // Cancel any existing debounce — the new state supersedes it
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
     }
@@ -71,16 +80,20 @@ export function useAudioConfigSync() {
 
       restartingRef.current = true;
 
-      // Read the latest config (may have changed during debounce wait)
+      // Read the latest state (may have changed during debounce wait)
       const latestConfig = useConfigStore.getState().meetingAudioConfig;
+      const latestLanguage = useConfigStore.getState().sttLanguage;
       if (!latestConfig) {
         restartingRef.current = false;
         return;
       }
 
-      const latestKey = JSON.stringify(latestConfig);
+      const latestKey = JSON.stringify({
+        config: latestConfig,
+        language: latestLanguage,
+      });
 
-      // If the latest config matches what's already running, skip
+      // If the latest state matches what's already running, skip
       if (appliedConfigRef.current === latestKey) {
         pendingConfigRef.current = latestKey;
         restartingRef.current = false;
@@ -101,16 +114,25 @@ export function useAudioConfigSync() {
         // Let Rust fully release WASAPI/audio resources
         await new Promise((r) => setTimeout(r, 200));
 
-        // Re-read config in case it changed during the stop
+        // Re-read config and language in case either changed during the stop
         const freshConfig = useConfigStore.getState().meetingAudioConfig;
+        const freshLanguage = useConfigStore.getState().sttLanguage;
         if (!freshConfig) {
           log("warn", "config", "Hot-swap: no config available after stop");
           return;
         }
 
-        log("info", "config", "Hot-swap: starting new capture pipeline...");
+        log(
+          "info",
+          "config",
+          `Hot-swap: starting new capture pipeline (language=${freshLanguage})...`
+        );
         await startCapturePerParty(freshConfig.you, freshConfig.them);
-        const freshKey = JSON.stringify(freshConfig);
+
+        const freshKey = JSON.stringify({
+          config: freshConfig,
+          language: freshLanguage,
+        });
         appliedConfigRef.current = freshKey;
         pendingConfigRef.current = freshKey;
         log("info", "config", "Hot-swap complete — new STT pipeline active");
@@ -124,7 +146,7 @@ export function useAudioConfigSync() {
         restartingRef.current = false;
       }
     }, 300);
-  }, [isRecording, meetingAudioConfig]);
+  }, [isRecording, meetingAudioConfig, runtimeKey, sttLanguage]);
 
   // Reset when meeting ends
   useEffect(() => {
