@@ -54,7 +54,6 @@ const DEFAULT_HOTKEYS: HotkeyConfig = {
   mode_ask: "5",
 };
 
-// Singleton store instance, lazily initialized
 let storeInstance: Store | null = null;
 
 async function getStore(): Promise<Store> {
@@ -64,11 +63,6 @@ async function getStore(): Promise<Store> {
   return storeInstance;
 }
 
-/**
- * Persist a key-value pair to the Tauri plugin-store.
- * Errors are logged and re-thrown so callers that need deterministic persistence
- * can await the write before continuing.
- */
 async function persistValue(key: string, value: unknown): Promise<void> {
   try {
     const store = await getStore();
@@ -80,72 +74,36 @@ async function persistValue(key: string, value: unknown): Promise<void> {
 }
 
 interface ConfigState {
-  // Appearance
   theme: ThemeMode;
-
-  // Providers
   sttProvider: STTProviderType;
   sttLanguage: string;
   llmProvider: LLMProviderType;
   llmModel: string;
-
-  // Audio (legacy — kept for backward compat, new code uses meetingAudioConfig)
   micDeviceId: string | null;
   systemDeviceId: string | null;
   recordingEnabled: boolean;
-
-  // Two-Party Audio Config (new)
   meetingAudioConfig: MeetingAudioConfig | null;
-
-  // User-saved custom presets (persisted)
   customPresets: MeetingAudioConfig[];
-
-  // Local STT — globally active whisper model (e.g., "base", "small")
   activeWhisperModel: string | null;
-
-  // Per-engine active models — each engine independently selects its own model
-  // Keys are engine IDs (e.g., "sherpa_onnx", "ort_streaming", "whisper_cpp")
   activeModelPerEngine: Record<string, string>;
-
-  // Cloud providers that have been tested and verified (persisted)
   verifiedCloudProviders: string[];
-
-  // Whisper dual-pass config
   whisperDualPass: WhisperDualPassConfig;
-
-  // Deepgram model/feature config
   deepgramConfig: DeepgramConfig;
-
-  // Groq Whisper config
   groqConfig: GroqConfig;
-
-  // Universal pause threshold for transcript line-breaking (ms)
   pauseThresholdMs: number;
-
-  // Intelligence
   autoTrigger: boolean;
   autoSummary: boolean;
   contextWindowSeconds: number;
-
-  // System
   startOnLogin: boolean;
   dataDirectory: string;
   firstRunCompleted: boolean;
-
-  // Hotkeys
   hotkeys: HotkeyConfig;
-
-  // Context Strategy
   contextStrategy: ContextStrategy;
-
-  // In-person meeting mode settings
   rememberedMeetingSetup: { audioMode: AudioMode; scenario: AIScenario } | null;
   diarizationEnabled: boolean;
   noisePreset: string | null;
   confidenceThreshold: number;
   confidenceHighlightEnabled: boolean;
-
-  // Typeset settings
   transcriptFontSize: number;
   translationFontSize: number;
   transcriptTextColor: string;
@@ -155,35 +113,22 @@ interface ConfigState {
   aiResponseLineHeight: number;
   aiResponseHPad: number;
   aiResponseAlign: "left" | "center" | "right";
-
-  // Overlay appearance
   overlayOpacity: number;
-
-  // Post-meeting translation
   showPostMeetingTranslation: boolean;
-
-  // OpenRouter catalog
   openrouterFavorites: string[];
   openrouterRecentlyUsed: string[];
-
-  // Tray settings
   trayNotifications: boolean;
   trayAutoStart: boolean;
   trayStartMinimized: boolean;
   trayAutoDetectMeeting: boolean;
   trayStealthEnabled: boolean;
   stealthShortcut: string;
-
-  // Loading state
   _loaded: boolean;
-
-  // Mute state (non-persisted, session-only — resets on app restart)
   mutedYou: boolean;
   mutedThem: boolean;
   toggleMuteYou: () => void;
   toggleMuteThem: () => void;
 
-  // Actions
   setTheme: (theme: ThemeMode) => void;
   setContextStrategy: (strategy: ContextStrategy) => void;
   setSTTProvider: (provider: STTProviderType) => void;
@@ -293,50 +238,61 @@ export const useConfigStore = create<ConfigState>((set) => ({
   _loaded: false,
   mutedYou: false,
   mutedThem: false,
+
   toggleMuteYou: () => {
     const next = !useConfigStore.getState().mutedYou;
     set({ mutedYou: next });
     import("../lib/ipc").then(({ setSourceMuted }) =>
-      setSourceMuted("you", next)
-        .catch((e) => console.warn("[configStore] Failed to set You muted:", e))
+      setSourceMuted("you", next).catch((e) => console.warn("[configStore] Failed to set You muted:", e))
     );
   },
   toggleMuteThem: () => {
     const next = !useConfigStore.getState().mutedThem;
     set({ mutedThem: next });
     import("../lib/ipc").then(({ setSourceMuted }) =>
-      setSourceMuted("them", next)
-        .catch((e) => console.warn("[configStore] Failed to set Them muted:", e))
+      setSourceMuted("them", next).catch((e) => console.warn("[configStore] Failed to set Them muted:", e))
     );
   },
 
-  setContextStrategy: (strategy) => {
-    set({ contextStrategy: strategy });
-    persistValue("contextStrategy", strategy).catch(() => {});
-  },
   setTheme: (theme) => {
     set({ theme });
     persistValue("theme", theme).catch(() => {});
+  },
+  setContextStrategy: (strategy) => {
+    set({ contextStrategy: strategy });
+    persistValue("contextStrategy", strategy).catch(() => {});
   },
   setSTTProvider: (provider) => {
     set({ sttProvider: provider });
     persistValue("sttProvider", provider).catch(() => {});
   },
   setSTTLanguage: async (language) => {
-    set({ sttLanguage: language });
+    set((state) => ({
+      sttLanguage: language,
+      // Keep the frontend Groq configuration coherent with the global STT locale.
+      // The Rust command also updates shared_groq_config, but this prevents a later
+      // frontend config save/preset operation from re-introducing the old language.
+      groqConfig: { ...state.groqConfig, language: language.split("-")[0] },
+    }));
+
+    const groqConfigForPersistence = {
+      ...useConfigStore.getState().groqConfig,
+      language: language.split("-")[0],
+    };
 
     try {
-      // Persist the user's choice before returning so a rapid app restart
-      // cannot race the plugin-store write.
+      // Persist both values before returning so a rapid app restart cannot race
+      // the plugin-store writes.
       await persistValue("sttLanguage", language);
+      await persistValue("groqConfig", groqConfigForPersistence);
 
-      // Then apply the same exact BCP-47 value to the live Rust router.
       const { setSTTLanguage: setBackendSTTLanguage } = await import("../lib/ipc");
       await setBackendSTTLanguage(language);
     } catch (e) {
       console.warn("[configStore] Failed to persist/apply STT language:", e);
     }
   },
+
   setLLMProvider: (provider) => {
     set({ llmProvider: provider });
     persistValue("llmProvider", provider).catch(() => {});
@@ -360,7 +316,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
   setMeetingAudioConfig: (config) => {
     set({ meetingAudioConfig: config });
     persistValue("meetingAudioConfig", config).catch(() => {});
-    // Keep legacy fields in sync for backward compatibility
     set({
       micDeviceId: config.you.device_id || null,
       systemDeviceId: config.them.device_id || null,
@@ -373,10 +328,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
   saveCustomPreset: (name) => {
     const state = useConfigStore.getState();
     if (!state.meetingAudioConfig) return;
-    const preset: MeetingAudioConfig = {
-      ...state.meetingAudioConfig,
-      preset_name: name,
-    };
+    const preset: MeetingAudioConfig = { ...state.meetingAudioConfig, preset_name: name };
     const existing = state.customPresets.filter((p) => p.preset_name !== name);
     const updated = [...existing, preset];
     set({ customPresets: updated });
@@ -412,18 +364,12 @@ export const useConfigStore = create<ConfigState>((set) => ({
   setActiveModelForEngine: (engineId, modelId) => {
     const state = useConfigStore.getState();
     const updated = { ...state.activeModelPerEngine };
-    if (modelId) {
-      updated[engineId] = modelId;
-    } else {
-      delete updated[engineId];
-    }
+    if (modelId) updated[engineId] = modelId;
+    else delete updated[engineId];
     set({ activeModelPerEngine: updated });
     persistValue("activeModelPerEngine", updated).catch(() => {});
     import("../stores/devLogStore").then(({ useDevLogStore }) => {
-      useDevLogStore.getState().addEntry(
-        "info", "config",
-        `Model activated: ${engineId} → ${modelId ?? "none"}`
-      );
+      useDevLogStore.getState().addEntry("info", "config", `Model activated: ${engineId} → ${modelId ?? "none"}`);
     });
     if (state.meetingAudioConfig && modelId) {
       const cfg = { ...state.meetingAudioConfig };
@@ -450,10 +396,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
       }
     }
   },
-  getActiveModelForEngine: (engineId: string): string | null => {
-    const state = useConfigStore.getState();
-    return state.activeModelPerEngine[engineId] ?? null;
-  },
+  getActiveModelForEngine: (engineId: string): string | null => useConfigStore.getState().activeModelPerEngine[engineId] ?? null,
   setWhisperDualPass: (config) => {
     set({ whisperDualPass: config });
     persistValue("whisperDualPass", config).catch(() => {});
@@ -466,24 +409,21 @@ export const useConfigStore = create<ConfigState>((set) => ({
     set({ deepgramConfig: config });
     persistValue("deepgramConfig", config).catch(() => {});
     import("../lib/ipc").then(({ updateDeepgramConfig }) =>
-      updateDeepgramConfig(config)
-        .catch((e) => console.warn("[configStore] Failed to update Deepgram config:", e))
+      updateDeepgramConfig(config).catch((e) => console.warn("[configStore] Failed to update Deepgram config:", e))
     );
   },
   setGroqConfig: (config) => {
     set({ groqConfig: config });
     persistValue("groqConfig", config).catch(() => {});
     import("../lib/ipc").then(({ updateGroqConfig }) =>
-      updateGroqConfig(config)
-        .catch((e) => console.warn("[configStore] Failed to update Groq config:", e))
+      updateGroqConfig(config).catch((e) => console.warn("[configStore] Failed to update Groq config:", e))
     );
   },
   setPauseThresholdMs: (ms) => {
     set({ pauseThresholdMs: ms });
     persistValue("pauseThresholdMs", ms).catch(() => {});
     import("../lib/ipc").then(({ setPauseThreshold }) =>
-      setPauseThreshold(ms)
-        .catch((e) => console.warn("[configStore] Failed to update pause threshold:", e))
+      setPauseThreshold(ms).catch((e) => console.warn("[configStore] Failed to update pause threshold:", e))
     );
   },
   setAutoTrigger: (enabled) => {
@@ -705,7 +645,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
           preset_name: null,
         };
         await store.set("meetingAudioConfig", resolvedMeetingConfig);
-        console.log("[configStore] Migrated legacy audio config to meetingAudioConfig");
       }
 
       if (!alreadyLoaded && resolvedMeetingConfig) {
@@ -736,40 +675,24 @@ export const useConfigStore = create<ConfigState>((set) => ({
             local_model_id: undefined,
           };
           migrated = true;
-          console.log("[configStore] Migrated dual-exclusive STT: kept You, fell back Them to deepgram");
         }
-        if (migrated) {
-          await store.set("meetingAudioConfig", resolvedMeetingConfig);
-          console.log("[configStore] Migrated meetingAudioConfig providers");
-        }
+        if (migrated) await store.set("meetingAudioConfig", resolvedMeetingConfig);
       }
 
       let resolvedSttProvider = sttProvider;
       if (!alreadyLoaded && (!resolvedSttProvider || (resolvedSttProvider as string) === "whisper_cpp")) {
         resolvedSttProvider = "windows_native" as STTProviderType;
         await store.set("sttProvider", resolvedSttProvider);
-        console.log("[configStore] Migrated top-level sttProvider to windows_native");
       }
 
       if (!alreadyLoaded && !resolvedMeetingConfig) {
         resolvedMeetingConfig = {
-          you: {
-            role: "You",
-            device_id: "default",
-            is_input_device: true,
-            stt_provider: "web_speech",
-          },
-          them: {
-            role: "Them",
-            device_id: "default",
-            is_input_device: false,
-            stt_provider: "deepgram",
-          },
+          you: { role: "You", device_id: "default", is_input_device: true, stt_provider: "web_speech" },
+          them: { role: "Them", device_id: "default", is_input_device: false, stt_provider: "deepgram" },
           recording_enabled: false,
           preset_name: null,
         };
         await store.set("meetingAudioConfig", resolvedMeetingConfig);
-        console.log("[configStore] Created default meetingAudioConfig (Web Speech + Deepgram)");
       }
 
       set((state) => ({
@@ -827,7 +750,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
         ...(stealthShortcut != null && { stealthShortcut }),
       }));
 
-      // Post-load: ensure local providers have a local_model_id so footer/backend use the right model
       if (resolvedMeetingConfig) {
         const amp = activeModelPerEngine ?? {};
         const defaultModels: Record<string, string> = {
@@ -881,9 +803,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
         if (val != null) set({ overlayOpacity: val });
       });
 
-      // Synchronize the loaded language to the Rust backend before exposing
-      // the app as fully loaded. This removes the startup race where a meeting
-      // could begin while Rust still held its default en-US language.
       const loadedSttLanguage = sttLanguage ?? "en-US";
       try {
         const { setSTTLanguage: setBackendSTTLanguage } = await import("../lib/ipc");
@@ -892,7 +811,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
         console.warn("[configStore] Failed to sync STT language on load:", e);
       }
 
-      // Sync persisted dual-pass config to Rust backend on startup.
       const loadedDualPass = whisperDualPass ?? { shortChunkSecs: 1.0, longChunkSecs: 3.0, pauseSecs: 1.5 };
       import("../lib/ipc").then(({ updateWhisperDualPassConfig }) =>
         updateWhisperDualPassConfig(
@@ -931,9 +849,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
               ...(apiKey && { api_key: apiKey }),
             });
             await ipcSetLLM(config);
-            if (loadedLLMModel) {
-              await ipcSetModel(loadedLLMProvider, loadedLLMModel);
-            }
+            if (loadedLLMModel) await ipcSetModel(loadedLLMProvider, loadedLLMModel);
             console.log(`[configStore] LLM synced to backend: ${loadedLLMProvider} / ${loadedLLMModel}`);
           } catch (e) {
             console.warn("[configStore] Failed to sync LLM to backend:", e);
